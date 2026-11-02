@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Звонки</title>
+<style>
+  :root { --bg:#f6f7f4; --ink:#1d2421; --muted:#6b7570; --line:#dde2dc; --go:#1f7a4d; --stop:#c23b32; --card:#fff; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#141917; --ink:#eef1ee; --muted:#93a099; --line:#2a332f; --card:#1c2320; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:17px/1.4 -apple-system, system-ui, sans-serif;
+         padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom); }
+  main { max-width: 480px; margin: 0 auto; padding: 20px 16px; }
+  h1 { font-size: 24px; margin: 0 0 16px; }
+  input { width:100%; padding:14px; font-size:17px; border:1px solid var(--line); border-radius:10px;
+          background:var(--card); color:var(--ink); }
+  button { font:inherit; border:0; border-radius:10px; padding:14px 18px; background:var(--go); color:#fff; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--muted); padding:8px; }
+  button.stop { background:var(--stop); }
+  .row { display:flex; gap:8px; margin-bottom:12px; }
+  .row input { flex:1; }
+  .contact { display:flex; align-items:center; justify-content:space-between; padding:12px 0; border-bottom:1px solid var(--line); }
+  .contact small { color:var(--muted); display:block; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:var(--line); margin-right:8px; }
+  .dot.on { background:var(--go); }
+  .empty, #status { color:var(--muted); }
+  #call { position:fixed; inset:0; background:var(--bg); display:none; flex-direction:column;
+          align-items:center; justify-content:center; gap:20px; padding:24px; text-align:center; }
+  #call.show { display:flex; }
+  #callName { font-size:28px; }
+  .actions { display:flex; gap:16px; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<main>
+  <!-- Экран 1: регистрация -->
+  <section id="reg">
+    <h1>Ваш номер телефона</h1>
+    <div class="row"><input id="myPhone" type="tel" placeholder="+993 61 234567" autocomplete="tel"></div>
+    <button id="regBtn" style="width:100%">Войти</button>
+    <p id="regErr" style="color:var(--stop)"></p>
+  </section>
+
+  <!-- Экран 2: контакты -->
+  <section id="main" hidden>
+    <h1>Контакты</h1>
+    <div id="status"></div>
+    <div class="row">
+      <input id="newPhone" type="tel" placeholder="Номер контакта">
+      <button id="addBtn">Добавить</button>
+    </div>
+    <div id="list"></div>
+  </section>
+</main>
+
+<!-- Экран звонка -->
+<div id="call">
+  <div id="callName"></div>
+  <div id="callState" class="empty"></div>
+  <div class="actions">
+    <button id="acceptBtn" hidden>Ответить</button>
+    <button id="hangBtn" class="stop">Завершить</button>
+  </div>
+</div>
+<audio id="remote" autoplay playsinline></audio>
+
+<script>
+// ---------- Настройки ----------
+// STUN помогает телефонам найти друг друга. Для сложных сетей позже понадобится TURN.
+const ICE = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+
+// ---------- Состояние ----------
+let ws, myPhone = "", pc = null, localStream = null;
+let peer = null;            // с кем сейчас разговор
+let pendingOffer = null;    // входящий звонок, пока не ответили
+let pendingIce = [];        // кандидаты, пришедшие раньше времени
+let contacts = JSON.parse(localStorage.getItem("contacts") || "[]"); // хранятся на телефоне
+const $ = (id) => document.getElementById(id);
+const norm = (p) => "+" + String(p).replace(/\D/g, "");
+
+// ---------- Соединение с сервером ----------
+function connect(phone) {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(proto + "://" + location.host);
+  ws.onopen = () => ws.send(JSON.stringify({ type: "register", phone }));
+  ws.onclose = () => { $("status").textContent = "Нет связи с сервером, пробую снова…"; setTimeout(() => myPhone && connect(myPhone), 3000); };
+  ws.onmessage = (e) => handle(JSON.parse(e.data));
+}
+const send = (o) => ws.readyState === 1 && ws.send(JSON.stringify(o));
+
+function handle(m) {
+  if (m.type === "error") { $("regErr").textContent = m.text; myPhone = ""; }
+  if (m.type === "registered") {
+    myPhone = m.phone; localStorage.setItem("me", myPhone);
+    $("reg").hidden = true; $("main").hidden = false;
+    $("status").textContent = "Вы в сети как " + myPhone;
+    render(); checkAll();
+  }
+  if (m.type === "presence") { presence[m.phone] = m.online; render(); }
+  if (m.type === "unavailable") endCall("Абонент не в сети");
+  if (m.type === "offer") incoming(m);
+  if (m.type === "answer" && pc) pc.setRemoteDescription(m.sdp);
+  if (m.type === "ice") { pc && pc.remoteDescription ? pc.addIceCandidate(m.candidate) : pendingIce.push(m.candidate); }
+  if (m.type === "hangup" || m.type === "reject") endCall(m.type === "reject" ? "Звонок отклонён" : "Звонок завершён");
+}
+
+// ---------- Контакты ----------
+const presence = {};
+function checkAll() { contacts.forEach((c) => send({ type: "check", phone: c })); }
+setInterval(() => myPhone && checkAll(), 10000); // обновляем «в сети» каждые 10 секунд
+
+function render() {
+  const list = $("list"); list.innerHTML = "";
+  if (!contacts.length) { list.innerHTML = '<p class="empty">Добавьте номер друга, который тоже зашёл в приложение.</p>'; return; }
+  contacts.forEach((c) => {
+    const on = presence[c];
+    const row = document.createElement("div"); row.className = "contact";
+    row.innerHTML = `<div><span class="dot ${on ? "on" : ""}"></span>${c}<small>${on ? "в сети" : "не в сети"}</small></div>`;
+    const btns = document.createElement("div");
+    const call = document.createElement("button"); call.textContent = "Позвонить"; call.disabled = !on; call.style.opacity = on ? 1 : .4;
+    call.onclick = () => startCall(c);
+    const del = document.createElement("button"); del.className = "ghost"; del.textContent = "Удалить";
+    del.onclick = () => { contacts = contacts.filter((x) => x !== c); save(); render(); };
+    btns.append(call, del); row.append(btns); list.append(row);
+  });
+}
+const save = () => localStorage.setItem("contacts", JSON.stringify(contacts));
+
+// ---------- Звонок ----------
+function showCall(name, state, canAccept) {
+  $("callName").textContent = name; $("callState").textContent = state;
+  $("acceptBtn").hidden = !canAccept; $("call").classList.add("show");
+}
+
+async function makePeer(to) {
+  peer = to; pc = new RTCPeerConnection(ICE);
+  // Берём микрофон (iPhone спросит разрешение)
+  localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+  pc.onicecandidate = (e) => e.candidate && send({ type: "ice", to, candidate: e.candidate });
+  pc.ontrack = (e) => { $("remote").srcObject = e.streams[0]; $("remote").play().catch(() => {}); };
+  pc.onconnectionstatechange = () => {
+    if (pc && pc.connectionState === "connected") $("callState").textContent = "Разговор идёт";
+    if (pc && ["failed", "disconnected"].includes(pc.connectionState)) endCall("Связь потеряна");
+  };
+}
+
+async function startCall(to) {
+  try {
+    showCall(to, "Вызов…", false);
+    await makePeer(to);
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    send({ type: "offer", to, sdp: pc.localDescription });
+  } catch (err) { endCall("Нет доступа к микрофону. Страница должна быть открыта по https."); }
+}
+
+function incoming(m) {
+  if (pc) return send({ type: "reject", to: m.from }); // уже заняты
+  pendingOffer = m; peer = m.from;
+  showCall(m.from, "Входящий звонок", true);
+}
+
+$("acceptBtn").onclick = async () => {
+  try {
+    const m = pendingOffer; pendingOffer = null;
+    $("acceptBtn").hidden = true; $("callState").textContent = "Соединяю…";
+    await makePeer(m.from);
+    await pc.setRemoteDescription(m.sdp);
+    pendingIce.forEach((c) => pc.addIceCandidate(c)); pendingIce = [];
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    send({ type: "answer", to: m.from, sdp: pc.localDescription });
+  } catch (err) { endCall("Не удалось ответить"); }
+};
+
+$("hangBtn").onclick = () => {
+  if (pendingOffer) send({ type: "reject", to: peer });
+  else if (peer) send({ type: "hangup", to: peer });
+  endCall("");
+};
+
+function endCall(text) {
+  if (pc) pc.close(); pc = null;
+  if (localStream) localStream.getTracks().forEach((t) => t.stop()); localStream = null;
+  pendingOffer = null; pendingIce = []; peer = null;
+  $("call").classList.remove("show");
+  if (text) $("status").textContent = text;
+}
+
+// ---------- Кнопки ----------
+$("regBtn").onclick = () => { $("regErr").textContent = ""; connect(norm($("myPhone").value)); };
+$("addBtn").onclick = () => {
+  const p = norm($("newPhone").value);
+  if (p.length < 8 || p === myPhone || contacts.includes(p)) return;
+  contacts.push(p); save(); $("newPhone").value = ""; render(); send({ type: "check", phone: p });
+};
+// Если уже заходили раньше, подставляем номер
+$("myPhone").value = localStorage.getItem("me") || "";
+</script>
+</body>
+</html>
